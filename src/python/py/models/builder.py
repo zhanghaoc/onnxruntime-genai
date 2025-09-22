@@ -3925,7 +3925,7 @@ class GPTOSSModel(Model):
         self.moe_attrs["activation_beta"] = 1.0
         self.moe_attrs["activation_type"] = "swiglu"
         self.moe_attrs["normalize_routing_weights"] = True
-        self.moe_attrs["swiglu_fusion"] = 1
+        self.moe_attrs["swiglu_fusion"] = 0
 
     def make_layer(self, layer_id, layer):
         # Each LLM decoder layer is typically defined as:
@@ -3962,7 +3962,7 @@ class GPTOSSModel(Model):
         self.window_size = original_window_size
 
     def make_moe(self, layer_id, mlp, root_input):
-        if self.ep in {"cpu", "cuda"}:
+        if self.ep in {"cpu", "cuda", "NvTensorRtRtx", "trt-rtx"}:
             self.make_moe_fused(layer_id, mlp, root_input)            
         else:
             self.make_moe_decomposed(layer_id, mlp, root_input)
@@ -4245,10 +4245,20 @@ class GPTOSSModel(Model):
         gate_up_proj_transposed = mlp.experts.gate_up_proj.transpose(-1, -2)
         down_proj_transposed = mlp.experts.down_proj.transpose(-1, -2)
 
+        moe_name = f"{basename}/{op_type}"
+
         if op_type == "MoE":
             # Save non-quantized MoE weights as initializers
             self.make_initializer(gate_up_proj_transposed.view(self.moe_attrs["num_experts"], -1, self.hidden_size), gate_up_proj_weight, to=self.io_dtype)
             self.make_initializer(down_proj_transposed.view(self.moe_attrs["num_experts"], self.hidden_size, self.intermediate_size), down_proj_weight, to=self.io_dtype)
+            self.make_initializer(mlp.experts.gate_up_proj_bias, gate_up_proj_bias, to=self.io_dtype)
+            self.make_initializer(mlp.experts.down_proj_bias, down_proj_bias, to=self.io_dtype)
+
+            self.make_moe_op(
+                moe_name, root_input=root_input, router_probs=f"{router_reshape_name}/output_0",
+                weight1=gate_up_proj_weight, scales1=gate_up_proj_scales, bias1=gate_up_proj_bias,
+                weight2=down_proj_weight, scales2=down_proj_scales, bias2=down_proj_bias,
+            )
         else:
             # Create and save quantized MoE weights as initializers
             gate_up_proj_qweight_list, gate_up_proj_scales_list = [], []
@@ -4266,26 +4276,39 @@ class GPTOSSModel(Model):
             gate_up_proj_scales_tensor = torch.stack(gate_up_proj_scales_list, dim=0)
             down_proj_qweight_tensor = torch.stack(down_proj_qweight_list, dim=0).to(torch.uint8)
             down_proj_scales_tensor = torch.stack(down_proj_scales_list, dim=0)
+            
+            gate_proj_weight = f"model.layers.{layer_id}.moe.experts.gate_proj.{moe_weight_type}"
+            gate_proj_scales = f"model.layers.{layer_id}.moe.experts.gate_proj.scales"
+            gate_proj_bias = f"model.layers.{layer_id}.moe.experts.gate_proj.bias"
+            up_proj_weight = f"model.layers.{layer_id}.moe.experts.up_proj.{moe_weight_type}"
+            up_proj_scales = f"model.layers.{layer_id}.moe.experts.up_proj.scales"
+            up_proj_bias = f"model.layers.{layer_id}.moe.experts.up_proj.bias"
+
+            gate_proj_qweight_tensor, up_proj_qweight_tensor = gate_up_proj_qweight_tensor[:, ::2, :], gate_up_proj_qweight_tensor[:, 1::2, :]
+            gate_proj_scales_tensor, up_proj_scales_tensor = gate_up_proj_scales_tensor[:, ::2], gate_up_proj_scales_tensor[:, 1::2]
 
             # qweight tensors always use the same shape regardless of quantization method
             pack_size = 8 // self.moe_attrs["expert_weight_bits"]
-            self.make_initializer(gate_up_proj_qweight_tensor.view(self.moe_attrs["num_experts"], -1, self.hidden_size // pack_size), gate_up_proj_weight)
+            self.make_initializer(gate_proj_qweight_tensor.view(self.moe_attrs["num_experts"], -1, self.hidden_size // pack_size), gate_proj_weight)
+            self.make_initializer(up_proj_qweight_tensor.view(self.moe_attrs["num_experts"], -1, self.hidden_size // pack_size), up_proj_weight)
             self.make_initializer(down_proj_qweight_tensor.view(self.moe_attrs["num_experts"], self.hidden_size, self.intermediate_size // pack_size), down_proj_weight)
             
             # scales tensors have different shapes depending on quantization method
-            self.make_initializer(gate_up_proj_scales_tensor, gate_up_proj_scales, to=self.io_dtype)
+            self.make_initializer(gate_proj_scales_tensor, gate_proj_scales, to=self.io_dtype)
+            self.make_initializer(up_proj_scales_tensor, up_proj_scales, to=self.io_dtype)
             self.make_initializer(down_proj_scales_tensor, down_proj_scales, to=self.io_dtype)
 
-        # Save MoE biases as initializers
-        self.make_initializer(mlp.experts.gate_up_proj_bias, gate_up_proj_bias, to=self.io_dtype)
-        self.make_initializer(mlp.experts.down_proj_bias, down_proj_bias, to=self.io_dtype)
+            # Save MoE biases as initializers
+            self.make_initializer(mlp.experts.gate_up_proj_bias[:, ::2], gate_proj_bias, to=self.io_dtype)
+            self.make_initializer(mlp.experts.gate_up_proj_bias[:, 1::2], up_proj_bias, to=self.io_dtype)
+            self.make_initializer(mlp.experts.down_proj_bias, down_proj_bias, to=self.io_dtype)
 
-        moe_name = f"{basename}/{op_type}"
-        self.make_moe_op(
-            moe_name, root_input=root_input, router_probs=f"{router_reshape_name}/output_0",
-            weight1=gate_up_proj_weight, scales1=gate_up_proj_scales, bias1=gate_up_proj_bias,
-            weight2=down_proj_weight, scales2=down_proj_scales, bias2=down_proj_bias,
-        )
+            self.make_moe_op(
+                moe_name, root_input=root_input, router_probs=f"{router_reshape_name}/output_0",
+                weight1=gate_proj_weight, scales1=gate_proj_scales, bias1=gate_proj_bias,
+                weight2=down_proj_weight, scales2=down_proj_scales, bias2=down_proj_bias,
+                weight3=up_proj_weight, scales3=up_proj_scales, bias3=up_proj_bias,
+            )
 
         # Assign output 0 of previous MoE as root input to next SkipLayerNorm
         self.layernorm_attrs["skip_input"] = f"{moe_name}/output_0"
